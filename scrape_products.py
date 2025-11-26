@@ -1,65 +1,109 @@
+# scrape_products.py
+import csv
+from urllib.parse import urljoin
+
 import requests
 from bs4 import BeautifulSoup
-import csv
 
 BASE_URL = "https://www.dwcuratedvintage.com"
 START_URL = BASE_URL + "/shop"
+OUTPUT_FILE = "products.csv"
 
-def get_product_links():
-    print("Fetching product links...")
-    response = requests.get(START_URL)
-    soup = BeautifulSoup(response.text, "html.parser")
 
-    links = []
-    for a in soup.select("a[href*='/product/']"):
+def get_product_links() -> list[str]:
+    """
+    Grab all product links from the main /shop page.
+    Squarespace product URLs look like: /shop/p/akira-1988-vintage-single-stitch-tee
+    """
+    print(f"Fetching product links from {START_URL} ...")
+    resp = requests.get(START_URL, timeout=20)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    links: list[str] = []
+
+    # any <a href="/shop/p/...">
+    for a in soup.select('a[href^="/shop/p/"]'):
         href = a.get("href")
-        if href and href not in links:
+        if not href:
+            continue
+        if href not in links:
             links.append(href)
 
     print(f"Found {len(links)} product links")
     return links
 
 
-def scrape_product_page(url):
-    full_url = BASE_URL + url
-    print(f"Scraping: {full_url}")
+def scrape_product_page(relative_url: str) -> dict:
+    """
+    Scrape ONE product page and return basic info.
+    """
+    full_url = urljoin(BASE_URL, relative_url)
+    print(f"Scraping {full_url} ...")
 
-    response = requests.get(full_url)
-    soup = BeautifulSoup(response.text, "html.parser")
+    resp = requests.get(full_url, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    title = soup.find("h1")
-    title = title.text.strip() if title else "Unknown Item"
+    # ---- title ----
+    title_el = soup.select_one("h1.product-title") or soup.select_one("h1")
+    title = title_el.get_text(strip=True) if title_el else "Unknown Item"
 
-    price = soup.find("span", class_="sqs-money-native")
-    price = price.text.strip() if price else "Unknown Price"
+    # ---- price ----
+    price_el = (
+        soup.select_one("#main-product-price")
+        or soup.select_one(".sqs-money-native")
+        or soup.select_one(".product-price")
+    )
+    price = price_el.get_text(strip=True) if price_el else "Unknown Price"
 
-    desc_block = soup.find("div", class_="ProductItem-details-excerpt")
-    description = desc_block.text.strip() if desc_block else ""
+    # ---- description ----
+    desc_el = soup.select_one(".product-description") or soup.select_one(".sqs-html-content")
+    description = desc_el.get_text("\n", strip=True) if desc_el else ""
+
+    # crude “size/measurements” slice from description so the bot can show something
+    size_bits = []
+    for line in description.splitlines():
+        lower = line.lower()
+        if any(
+            kw in lower
+            for kw in ["measurements", "pit to pit", "pit-to-pit", "waist", "length", "inseam"]
+        ):
+            size_bits.append(line.strip())
+    size_text = " ".join(size_bits)
 
     return {
-        "name": title,
+        "title": title,
         "price": price,
+        "size": size_text,
+        "url": full_url,
         "description": description,
-        "link": full_url
     }
 
 
 def main():
-    product_links = get_product_links()
-    products = []
+    links = get_product_links()
+    rows = []
 
-    for link in product_links:
-        data = scrape_product_page(link)
-        products.append(data)
+    for rel in links:
+        try:
+            rows.append(scrape_product_page(rel))
+        except Exception as e:
+            print(f"!! Error scraping {rel}: {e}")
 
-    with open("products.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "price", "description", "link"])
+    if not rows:
+        print("No products scraped. Nothing to write.")
+        return
+
+    fieldnames = ["title", "price", "size", "url", "description"]
+    print(f"Writing {len(rows)} products to {OUTPUT_FILE} ...")
+    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(products)
+        writer.writerows(rows)
 
-    print(f"\n✅ Wrote {len(products)} products to products.csv")
+    print("Done.")
 
 
 if __name__ == "__main__":
     main()
-
