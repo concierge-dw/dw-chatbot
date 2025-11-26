@@ -297,7 +297,20 @@ async def dw_chat(req: ChatRequest):
 
     inventory_reply = ""
     if wants_links:
-        inventory_reply = search_inventory(user_msg)
+        # ---- NEW: use conversation history to build the search query ----
+        search_bits = []
+
+        # include recent user messages from history
+        for h in req.history:
+            if h.get("role") == "user":
+                search_bits.append(h.get("content", ""))
+
+        # add the current message
+        search_bits.append(user_msg)
+
+        # use the last 3 user messages as the search text
+        search_query = " ".join(search_bits[-3:])
+        inventory_reply = search_inventory(search_query)
 
     if inventory_reply:
         reply_text = (
