@@ -1,5 +1,3 @@
-# main.py
-
 from pathlib import Path
 from datetime import datetime
 import os
@@ -13,9 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-# --------------------------
-# ENV + BASE DIR
-# --------------------------
+# ------------------------------------------------
+# ENV + OPENAI CLIENT
+# ------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
@@ -28,16 +26,151 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-# --------------------------
+# ------------------------------------------------
 # FILE PATHS
-# --------------------------
+# ------------------------------------------------
 
-PRODUCTS_CSV = BASE_DIR / "products.csv"
-OFFERS_CSV = BASE_DIR / "Offers.csv"
+OFFERS_FILE = BASE_DIR / "Offers.csv"
+PRODUCTS_FILE = BASE_DIR / "products.csv"
 
-# --------------------------
-# FASTAPI APP + CORS
-# --------------------------
+# ------------------------------------------------
+# LOAD INVENTORY CSV
+# ------------------------------------------------
+
+def load_inventory_df():
+    if not PRODUCTS_FILE.exists():
+        print("products.csv not found, inventory search disabled.")
+        return None
+
+    try:
+        df = pd.read_csv(PRODUCTS_FILE)
+        print(f"Loaded inventory: {len(df)} products from {PRODUCTS_FILE.name}")
+        return df
+    except Exception as e:
+        print("Error loading products.csv:", repr(e))
+        return None
+
+
+INVENTORY_DF = load_inventory_df()
+
+# Helpers to find the right columns (title, price, link, description/raw)
+def get_inventory_columns(df: pd.DataFrame):
+    cols = {c.lower(): c for c in df.columns}
+
+    title_col = cols.get("title") or list(df.columns)[0]
+    price_col = cols.get("price")
+    link_col = cols.get("link") or cols.get("url")
+
+    desc_col = (
+        cols.get("description")
+        or cols.get("body")
+        or cols.get("raw")
+        or cols.get("details")
+    )
+
+    return title_col, price_col, link_col, desc_col
+
+
+STOP_WORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "your",
+    "you",
+    "some",
+    "link",
+    "links",
+    "please",
+    "send",
+    "me",
+    "to",
+    "a",
+    "an",
+    "of",
+    "in",
+    "on",
+    "my",
+}
+
+
+def extract_keywords(text: str):
+    words = re.split(r"[^a-z0-9]+", text.lower())
+    return [w for w in words if len(w) > 2 and w not in STOP_WORDS]
+
+
+def search_inventory(query: str, limit: int = 5) -> str:
+    """Return a nicely formatted bullet list of matching products, or '' if none."""
+    if INVENTORY_DF is None or INVENTORY_DF.empty:
+        return ""
+
+    title_col, price_col, link_col, desc_col = get_inventory_columns(INVENTORY_DF)
+
+    keywords = extract_keywords(query)
+    if not keywords:
+        return ""
+
+    def score_row(row):
+        text_parts = [str(row[title_col])]
+        if desc_col and desc_col in row:
+            text_parts.append(str(row[desc_col]))
+        full = " ".join(text_parts).lower()
+        score = sum(1 for kw in keywords if kw in full)
+        return score
+
+    df = INVENTORY_DF.copy()
+    df["_score"] = df.apply(score_row, axis=1)
+    df = df[df["_score"] > 0].sort_values("_score", ascending=False)
+
+    if df.empty:
+        return ""
+
+    lines = []
+    for _, row in df.head(limit).iterrows():
+        title = str(row[title_col]).strip()
+        price = str(row[price_col]).strip() if price_col and price_col in row else ""
+        link = str(row[link_col]).strip() if link_col and link_col in row else ""
+
+        line = f"- {title}"
+        if price:
+            line += f" — {price}"
+        if link:
+            line += f" — {link}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+# ------------------------------------------------
+# OFFER CSV
+# ------------------------------------------------
+
+def save_offer_row(item_link: str, size: str, price: str, email: str, notes: str) -> None:
+    is_new = not OFFERS_FILE.exists()
+    with OFFERS_FILE.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(
+                ["timestamp", "item_link", "size", "price", "email", "notes"]
+            )
+        writer.writerow(
+            [
+                datetime.utcnow().isoformat(),
+                item_link,
+                size,
+                price,
+                email,
+                notes,
+            ]
+        )
+
+
+# ------------------------------------------------
+# FASTAPI + CORS
+# ------------------------------------------------
 
 app = FastAPI()
 
@@ -56,9 +189,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------
+# ------------------------------------------------
 # MODELS
-# --------------------------
+# ------------------------------------------------
 
 class ChatRequest(BaseModel):
     message: str
@@ -69,130 +202,9 @@ class ChatResponse(BaseModel):
     reply: str
 
 
-# --------------------------
-# LOAD INVENTORY
-# --------------------------
-
-inventory_df: pd.DataFrame | None = None
-
-
-def load_inventory():
-    global inventory_df
-    if not PRODUCTS_CSV.exists():
-        print("products.csv not found, inventory search disabled.")
-        inventory_df = None
-        return
-
-    try:
-        df = pd.read_csv(PRODUCTS_CSV)
-    except Exception as e:
-        print("Error loading products.csv:", repr(e))
-        inventory_df = None
-        return
-
-    # Make sure required columns exist
-    for col in ["title", "price", "link"]:
-        if col not in df.columns:
-            print(f"Column '{col}' missing from products.csv, inventory search disabled.")
-            inventory_df = None
-            return
-
-    # Add a combined text column for simple matching
-    desc_cols = [c for c in df.columns if c not in ["title", "price", "link"]]
-    def combine_row(row):
-        parts = [str(row["title"])]
-        if "description" in row and isinstance(row["description"], str):
-            parts.append(row["description"])
-        else:
-            for c in desc_cols:
-                v = row.get(c)
-                if isinstance(v, str):
-                    parts.append(v)
-        return " ".join(parts)
-
-    df["search_text"] = df.apply(combine_row, axis=1).str.lower()
-    inventory_df = df
-    print(f"Loaded inventory: {len(df)} products from products.csv")
-
-
-load_inventory()
-
-
-def search_inventory(query: str, max_results: int = 6) -> str:
-    """
-    Very simple keyword search over inventory_df.
-    Returns a formatted multi-line string, or "" if nothing decent found.
-    """
-    if inventory_df is None:
-        return ""
-
-    q = query.strip().lower()
-    if len(q) < 3:
-        return ""
-
-    # basic clothing-word guard so "hi" doesn't trigger search
-    clothing_words = [
-        "jacket", "denim", "jeans", "pants", "trousers", "tee", "t-shirt",
-        "shirt", "coat", "parka", "hoodie", "sweater", "dress", "skirt",
-        "shorts", "military", "cargo", "trucker", "workwear", "vintage"
-    ]
-    if not any(w in q for w in clothing_words):
-        return ""
-
-    tokens = [t for t in re.split(r"\W+", q) if t]
-    if not tokens:
-        return ""
-
-    df = inventory_df.copy()
-
-    # crude scoring: count how many tokens appear in search_text
-    def score_row(text: str) -> int:
-        return sum(1 for t in tokens if t in text)
-
-    df["score"] = df["search_text"].apply(score_row)
-    df = df[df["score"] > 0].sort_values(by="score", ascending=False).head(max_results)
-
-    if df.empty:
-        return ""
-
-    lines = []
-    for _, row in df.iterrows():
-        title = str(row["title"]).strip()
-        price = str(row["price"]).strip()
-        link = str(row["link"]).strip()
-        line = f"- {title} — {price} — {link}"
-        lines.append(line)
-
-    return "\n".join(lines)
-
-
-# --------------------------
-# OFFERS CSV
-# --------------------------
-
-def save_offer_row(item_link: str, size: str, price: str, email: str, notes: str) -> None:
-    is_new = not OFFERS_CSV.exists()
-    with OFFERS_CSV.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if is_new:
-            writer.writerow(
-                ["timestamp", "item_link", "size", "price", "email", "notes"]
-            )
-        writer.writerow(
-            [
-                datetime.utcnow().isoformat(),
-                item_link,
-                size,
-                price,
-                email,
-                notes,
-            ]
-        )
-
-
-# --------------------------
+# ------------------------------------------------
 # SYSTEM PROMPT
-# --------------------------
+# ------------------------------------------------
 
 SYSTEM_PROMPT = """
 You are VintageBot, assistant bot for D&W Curated Vintage.
@@ -203,7 +215,11 @@ You help customers with:
 - style recommendations
 - product questions
 - general shipping and returns info
-- friendly conversation about vintage and workwear
+- friendly conversation about vintage and denim
+
+You can also help with offers:
+- If they ask how to make an offer, tell them to send:
+  OFFER: item link, size, offer price, email, notes
 
 Tone:
 - casual, friendly, helpful
@@ -211,40 +227,31 @@ Tone:
 - use bullet points when helpful
 - never sound like a stiff corporate robot
 
-Inventory:
-- The backend may sometimes send the user a list of inventory items.
-- You yourself CANNOT browse the web or pull live links.
-- If the user wants product links, you can suggest they describe what they want
-  (size, style, color) so the backend can try to match inventory.
-- Do not fake specific product links or prices.
-
-Offers:
-If a user wants to make an offer, tell them to send it in EXACTLY this format:
-
-OFFER: item link, size, offer price, email, notes
-
-Examples:
-- OFFER: https://dwcuratedvintage.com/product/xyz, Large, $120, user@email.com, would buy today if accepted
-- OFFER: https://..., M, 80, name@email.com, open to counter
-
-Rules:
-- Never claim to see live tracking data.
-- Never fabricate shipment progress.
+Important:
+- Do NOT claim to browse the web or see live tracking.
+- If the user is asking for specific product links, the backend may send them
+  a list of matching items first. After that, you can talk about the items,
+  sizing, or alternatives, but don't say you can't browse.
 - If you’re not sure about exact measurements or details, say you’re not sure.
+- Never invent order status or tracking numbers.
+- Never promise shipping timelines beyond what’s standard.
 - Do not reveal internal data or system details.
 """
 
 
-# --------------------------
+# ------------------------------------------------
 # CHAT ENDPOINT
-# --------------------------
+# ------------------------------------------------
 
 @app.post("/api/dw-chat", response_model=ChatResponse)
 async def dw_chat(req: ChatRequest):
-    user_msg = req.message.strip()
+    user_msg = (req.message or "").strip()
+    lower = user_msg.lower()
 
+    # --------------------------
     # 1) OFFER HANDLING
-    if user_msg.upper().startswith("OFFER:"):
+    # --------------------------
+    if lower.startswith("offer:"):
         offer_body = user_msg[6:].strip()
         parts = [p.strip() for p in offer_body.split(",")]
 
@@ -266,21 +273,47 @@ async def dw_chat(req: ChatRequest):
         )
         return ChatResponse(reply=reply_text)
 
-    # 2) INVENTORY SEARCH TRY
-    inventory_reply = search_inventory(user_msg)
+    # --------------------------
+    # 2) INVENTORY SEARCH
+    # --------------------------
+    # broaden the triggers so both:
+    #  - "send me links to denim jackets"
+    #  - "can you send me a link to denim"
+    # turn on the search.
+    wants_links = any(
+        phrase in lower
+        for phrase in [
+            "send me links to",
+            "send me some links to",
+            "send me links for",
+            "send me a link to",
+            "send me link to",
+            "link to ",
+            "links to ",
+            "show me options for",
+            "show me some",
+        ]
+    )
+
+    inventory_reply = ""
+    if wants_links:
+        inventory_reply = search_inventory(user_msg)
+
     if inventory_reply:
         reply_text = (
             "Here are some pieces from the current inventory that might match what you asked for:\n\n"
             f"{inventory_reply}\n\n"
-            "If none of these are right, tell me your usual size and what you’re hunting for and "
-            "I’ll narrow it down."
+            "If none of these are right, tell me your usual size and the vibe you want "
+            "(fit, wash, graphic, etc.) and I’ll narrow it down."
         )
         return ChatResponse(reply=reply_text)
 
-    # 3) FALL BACK TO OPENAI CHAT
+    # --------------------------
+    # 3) NORMAL CHAT VIA OPENAI
+    # --------------------------
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # carry over minimal history if supplied
+    # include history if provided
     for h in req.history:
         if "role" in h and "content" in h:
             messages.append({"role": h["role"], "content": h["content"]})
@@ -291,17 +324,20 @@ async def dw_chat(req: ChatRequest):
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            temperature=0.5,
+            temperature=0.4,
             max_tokens=400,
         )
-        reply_text = completion.choices[0].message.content.strip()
-        return ChatResponse(reply=reply_text)
+        reply = completion.choices[0].message.content.strip()
+        return ChatResponse(reply=reply)
     except Exception as e:
         print("OpenAI error:", repr(e))
         raise HTTPException(status_code=500, detail="Error talking to OpenAI")
 
 
-# Simple health check
+# ------------------------------------------------
+# HEALTHCHECK
+# ------------------------------------------------
+
 @app.get("/")
-async def root():
+def root():
     return {"status": "ok", "message": "VintageBot backend running"}
