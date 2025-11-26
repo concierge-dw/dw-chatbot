@@ -59,7 +59,7 @@ app.add_middleware(
 
 
 # --------------------------
-# Pydantic MODELS
+# MODELS
 # --------------------------
 
 class ChatRequest(BaseModel):
@@ -255,7 +255,7 @@ def call_openai(user_msg: str) -> str:
 # API ENDPOINTS
 # --------------------------
 
-@app.post("/", response_model=ChatResponse)
+@app.post("/api/dw-chat", response_model=ChatResponse)
 async def vintagebot_chat(req: ChatRequest):
     """
     Main chat endpoint used by the Squarespace widget.
