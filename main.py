@@ -103,7 +103,10 @@ def extract_keywords(text: str):
 
 
 def search_inventory(query: str, limit: int = 5) -> str:
-    """Return a nicely formatted bullet list of matching products, or '' if none."""
+    """
+    Return HTML with clickable links for matching products, or '' if none.
+    This will be rendered on the front-end using innerHTML for bot messages.
+    """
     if INVENTORY_DF is None or INVENTORY_DF.empty:
         return ""
 
@@ -134,12 +137,21 @@ def search_inventory(query: str, limit: int = 5) -> str:
         price = str(row[price_col]).strip() if price_col and price_col in row else ""
         link = str(row[link_col]).strip() if link_col and link_col in row else ""
 
-        line = f"- {title}"
+        # HTML block for each item
+        block = "<div style='margin-bottom:10px;'>"
+        block += f"<strong>{title}</strong>"
         if price:
-            line += f" — {price}"
+            block += f" — {price}"
         if link:
-            line += f" — {link}"
-        lines.append(line)
+            block += (
+                "<br>"
+                f"<a href='{link}' target='_blank' "
+                "style='color:#ffffff;text-decoration:underline;'>"
+                "View item</a>"
+            )
+        block += "</div>"
+
+        lines.append(block)
 
     return "\n".join(lines)
 
@@ -229,9 +241,10 @@ Tone:
 
 Important:
 - Do NOT claim to browse the web or see live tracking.
-- If the user is asking for specific product links, the backend may send them
-  a list of matching items first. After that, you can talk about the items,
-  sizing, or alternatives, but don't say you can't browse.
+- The backend may send the user a list of matching inventory items with links.
+  When that happens, you can discuss those items, sizing, and alternatives.
+- Do NOT say things like "I can't send links" or "I can't browse" — just focus
+  on helping with fit, style, and sizing using the information you have.
 - If you’re not sure about exact measurements or details, say you’re not sure.
 - Never invent order status or tracking numbers.
 - Never promise shipping timelines beyond what’s standard.
@@ -276,39 +289,62 @@ async def dw_chat(req: ChatRequest):
     # --------------------------
     # 2) INVENTORY SEARCH
     # --------------------------
-    # broaden the triggers so both:
-    #  - "send me links to denim jackets"
-    #  - "can you send me a link to denim"
-    # turn on the search.
-    wants_links = any(
-        phrase in lower
-        for phrase in [
-            "send me links to",
-            "send me some links to",
-            "send me links for",
-            "send me a link to",
-            "send me link to",
-            "link to ",
-            "links to ",
-            "show me options for",
-            "show me some",
-        ]
-    )
+    # More generous triggers so "links of some military pants" also hits search.
+    core_triggers = [
+        "send me links to",
+        "send me some links to",
+        "send me links for",
+        "send me a link to",
+        "send me link to",
+        "send me links of",
+        "send me link of",
+        "link to ",
+        "links to ",
+        "links of ",
+        "show me options for",
+        "show me some",
+    ]
+
+    clothing_words = [
+        "jeans",
+        "pants",
+        "trousers",
+        "denim",
+        "jacket",
+        "jackets",
+        "tee",
+        "t-shirt",
+        "shirt",
+        "shirts",
+        "coat",
+        "coats",
+        "dress",
+        "dresses",
+        "skirt",
+        "skirts",
+        "shorts",
+        "hoodie",
+        "sweater",
+        "sweatshirt",
+    ]
+
+    wants_links = any(phrase in lower for phrase in core_triggers)
+
+    # If user mentions "link/links" AND a clothing word, also trigger search
+    if not wants_links:
+        if ("link" in lower or "links" in lower) and any(
+            w in lower for w in clothing_words
+        ):
+            wants_links = True
 
     inventory_reply = ""
     if wants_links:
-        # ---- NEW: use conversation history to build the search query ----
+        # use recent user history + current message to build the search text
         search_bits = []
-
-        # include recent user messages from history
         for h in req.history:
             if h.get("role") == "user":
                 search_bits.append(h.get("content", ""))
-
-        # add the current message
         search_bits.append(user_msg)
-
-        # use the last 3 user messages as the search text
         search_query = " ".join(search_bits[-3:])
         inventory_reply = search_inventory(search_query)
 
